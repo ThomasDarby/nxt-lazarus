@@ -35,6 +35,11 @@ jobs:
             --hidden-import usb.backend.libusb1 \
             --hidden-import usb.backend.libusb0 \
             --hidden-import usb.backend.openusb \
+            --hidden-import nxt_toolkit.compiler \
+            --hidden-import nxt_toolkit.bytecode \
+            --hidden-import nxt_toolkit.dataspace \
+            --hidden-import nxt_toolkit.rxe_writer \
+            --hidden-import nxt_toolkit.usb \
             --osx-bundle-identifier com.nxttoolkit.app \
             nxt_toolkit/app.py
 

@@ -104,6 +104,31 @@ x = 10
 x = x + 1           # operators: +, -, *, /, %
 ```
 
+### Functions
+
+```
+def drive(power, duration):
+    motor(B).on(power)
+    motor(C).on(power)
+    wait(duration)
+    motor(B).off()
+    motor(C).off()
+end
+
+def turn_right:
+    motor(B).on(50)
+    motor(C).on(-50)
+    wait(600)
+    motor(B).off()
+    motor(C).off()
+end
+
+drive(75, 1500)       # call with arguments
+turn_right()          # call with no arguments
+```
+
+Functions can take parameters or none at all. Note: recursion is not supported (NXT hardware limitation).
+
 ### Comments
 
 ```

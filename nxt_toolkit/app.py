@@ -10,7 +10,10 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox
 import tempfile
 import traceback
 
-from .compiler import compile_source
+try:
+    from .compiler import compile_source
+except ImportError:
+    from nxt_toolkit.compiler import compile_source
 
 # Default file extension
 FILE_EXT = ".nxt"
@@ -509,7 +512,10 @@ class NXTToolkitApp:
         self._log("Connecting to NXT...", "info")
 
         try:
-            from .usb import NXTConnection
+            try:
+                from .usb import NXTConnection
+            except ImportError:
+                from nxt_toolkit.usb import NXTConnection
             conn = NXTConnection.find()
 
             def progress(sent, total):
@@ -537,7 +543,10 @@ class NXTToolkitApp:
         self._log("Starting program on NXT...", "info")
 
         try:
-            from .usb import NXTConnection
+            try:
+                from .usb import NXTConnection
+            except ImportError:
+                from nxt_toolkit.usb import NXTConnection
             conn = NXTConnection.find()
             conn.start_program(nxt_filename)
             self._log("Program started!", "success")
@@ -554,7 +563,10 @@ class NXTToolkitApp:
         self._log("Searching for NXT brick...", "info")
 
         try:
-            from .usb import NXTConnection
+            try:
+                from .usb import NXTConnection
+            except ImportError:
+                from nxt_toolkit.usb import NXTConnection
             conn = NXTConnection.find()
             info = conn.get_device_info()
             self._log(f"Connected to: {info['name']}", "success")
