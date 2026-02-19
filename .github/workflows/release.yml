@@ -1,0 +1,57 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller pyusb
+          brew install libusb
+
+      - name: Build app with PyInstaller
+        run: |
+          LIBUSB="$(brew --prefix libusb)/lib/libusb-1.0.dylib"
+          pyinstaller \
+            --name "NXT Toolkit" \
+            --windowed \
+            --onedir \
+            --noconfirm \
+            --add-binary "$LIBUSB:." \
+            --add-data "examples:examples" \
+            --hidden-import usb.backend.libusb1 \
+            --hidden-import usb.backend.libusb0 \
+            --hidden-import usb.backend.openusb \
+            --osx-bundle-identifier com.nxttoolkit.app \
+            nxt_toolkit/app.py
+
+      - name: Create DMG
+        run: |
+          hdiutil create \
+            -volname "NXT Toolkit" \
+            -srcfolder "dist/NXT Toolkit.app" \
+            -ov \
+            -format UDZO \
+            "dist/NXT-Toolkit.dmg"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/NXT-Toolkit.dmg" \
+            --title "NXT Toolkit $GITHUB_REF_NAME" \
+            --generate-notes
