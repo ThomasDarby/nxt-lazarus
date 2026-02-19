@@ -30,6 +30,7 @@ from .bytecode import (
     OP_MOV, OP_SET, OP_CMP, OP_TST,
     OP_JMP, OP_BRCMP, OP_BRTST,
     OP_SYSCALL, OP_STOP, OP_WAIT,
+    OP_SUBCALL, OP_SUBRET,
     OP_SETIN, OP_SETOUT, OP_GETIN,
     CC_LT, CC_GT, CC_LTEQ, CC_GTEQ, CC_EQ, CC_NEQ,
     SENSOR_TYPE_TOUCH, SENSOR_TYPE_LIGHT_ACTIVE, SENSOR_TYPE_SOUND_DB,
@@ -74,6 +75,7 @@ KEYWORDS = {
     "on", "off", "coast",
     "play_tone", "display", "clear_screen", "wait",
     "A", "B", "C",
+    "def",
 }
 
 @dataclass
@@ -283,6 +285,17 @@ class Repeat:
 class Forever:
     body: list
 
+@dataclass
+class FuncDef:
+    name: str
+    params: list  # parameter names (strings)
+    body: list
+
+@dataclass
+class FuncCallStmt:
+    name: str
+    args: list  # expression nodes
+
 
 # ─── Parser ─────────────────────────────────────────────────────────────────
 
@@ -321,11 +334,26 @@ class Parser:
                 f"Line {tok.line}: expected '{value}', got '{tok.value}'")
         return tok
 
-    def parse(self) -> list:
-        """Parse the entire program into a list of AST statements."""
+    def parse(self):
+        """Parse the entire program into function definitions and main statements.
+
+        Returns:
+            (func_defs, main_stmts) — function definitions are collected
+            separately so they can be compiled as separate clumps.
+        """
         self.skip_newlines()
-        stmts = self.parse_body(top_level=True)
-        return stmts
+        func_defs = []
+        main_stmts = []
+        while True:
+            self.skip_newlines()
+            tok = self.peek()
+            if tok.type == TokenType.EOF:
+                break
+            if tok.type == TokenType.KEYWORD and tok.value == "def":
+                func_defs.append(self.parse_func_def())
+            else:
+                main_stmts.append(self.parse_statement())
+        return func_defs, main_stmts
 
     def parse_body(self, top_level=False) -> list:
         """Parse statements until 'end', 'else', or EOF."""
@@ -377,8 +405,12 @@ class Parser:
         if tok.type == TokenType.KEYWORD and tok.value == "wait":
             return self.parse_wait()
 
-        # Assignment: name = expr
+        # Function call or assignment: name(...) vs name = expr
         if tok.type == TokenType.IDENT:
+            # Look ahead: LPAREN means function call, ASSIGN means assignment
+            next_tok = self.tokens[self.pos + 1] if self.pos + 1 < len(self.tokens) else None
+            if next_tok and next_tok.type == TokenType.LPAREN:
+                return self.parse_func_call_stmt()
             return self.parse_assignment()
 
         self.error("unexpected token")
@@ -482,6 +514,40 @@ class Parser:
         expr = self.parse_expr()
         return Assignment(name=name_tok.value, expr=expr)
 
+    def parse_func_def(self):
+        """Parse: def name(param1, param2): ... end  (or def name: ... end)"""
+        self.expect(TokenType.KEYWORD, "def")
+        name_tok = self.expect(TokenType.IDENT)
+        params = []
+        if self.peek().type == TokenType.LPAREN:
+            self.advance()  # consume (
+            if self.peek().type != TokenType.RPAREN:
+                param_tok = self.expect(TokenType.IDENT)
+                params.append(param_tok.value)
+                while self.peek().type == TokenType.COMMA:
+                    self.advance()  # consume ,
+                    param_tok = self.expect(TokenType.IDENT)
+                    params.append(param_tok.value)
+            self.expect(TokenType.RPAREN)
+        self.expect(TokenType.COLON)
+        self.skip_newlines()
+        body = self.parse_body()
+        self.expect(TokenType.KEYWORD, "end")
+        return FuncDef(name=name_tok.value, params=params, body=body)
+
+    def parse_func_call_stmt(self):
+        """Parse: name(arg1, arg2, ...)"""
+        name_tok = self.expect(TokenType.IDENT)
+        self.expect(TokenType.LPAREN)
+        args = []
+        if self.peek().type != TokenType.RPAREN:
+            args.append(self.parse_expr())
+            while self.peek().type == TokenType.COMMA:
+                self.advance()
+                args.append(self.parse_expr())
+        self.expect(TokenType.RPAREN)
+        return FuncCallStmt(name=name_tok.value, args=args)
+
     def parse_condition(self):
         """Parse a comparison expression: expr (< | > | == | != | <= | >=) expr"""
         left = self.parse_expr()
@@ -568,24 +634,66 @@ class CodeGenerator:
         self._consts: dict[int, int] = {}  # constant value → DSTOC index
         self._temp_counter = 0
         self._sensor_configured: set[int] = set()  # ports we've configured
+        self._funcs: dict[str, dict] = {}  # function name → info
+        self._param_overrides: dict[str, int] = {}  # active parameter scope
 
         # Pre-allocate commonly needed constants
         self._const_zero = self._get_const(0)
         self._const_one = self._get_const(1)
 
-    def compile(self, stmts: list) -> tuple[bytes, bytes, bytes, int, list[int]]:
-        """Compile a list of AST statements.
+    def compile(self, func_defs: list, main_stmts: list):
+        """Compile function definitions and main statements.
 
-        Returns: (dstoc_bytes, static_defaults, dynamic_defaults, ds_static_size, code_words)
+        Returns: (dstoc_bytes, static_defaults, dynamic_defaults,
+                  ds_static_size, code_words, clump_records)
         """
-        for stmt in stmts:
-            self._emit_stmt(stmt)
+        # Phase 1: Register all functions (allocate DSTOC entries)
+        for i, fdef in enumerate(func_defs):
+            clump_id = i + 1  # Clump 0 = main program
+            caller_ret = self.ds.add_scalar(
+                TC_SWORD, name=f"__ret_{fdef.name}", default=0, flags=1)
+            param_indices = []
+            for pname in fdef.params:
+                pidx = self.ds.add_scalar(
+                    TC_SLONG, name=f"__p_{fdef.name}_{pname}",
+                    default=0, flags=1)
+                param_indices.append(pidx)
+            self._funcs[fdef.name] = {
+                "clump_id": clump_id,
+                "caller_ret": caller_ret,
+                "params": fdef.params,
+                "param_indices": param_indices,
+            }
 
-        # Emit OP_STOP at end
+        # Phase 2: Compile main body (clump 0)
+        clump_records = []
+        main_start = self._current_offset()
+        for stmt in main_stmts:
+            self._emit_stmt(stmt)
         self.code.extend(encode_instruction(OP_STOP, 0))
+        clump_records.append((1, 0, main_start))
+
+        # Phase 3: Compile each function body
+        for fdef in func_defs:
+            finfo = self._funcs[fdef.name]
+            func_start = self._current_offset()
+            clump_records.append((1, 0, func_start))
+
+            # Set up parameter scope
+            self._param_overrides = {
+                pname: pidx
+                for pname, pidx in zip(fdef.params, finfo["param_indices"])
+            }
+
+            for stmt in fdef.body:
+                self._emit_stmt(stmt)
+
+            self.code.extend(encode_instruction(OP_SUBRET, finfo["caller_ret"]))
+            self._param_overrides = {}
 
         dstoc_bytes, static_defaults, dynamic_defaults, static_size, _ = self.ds.serialize()
-        return dstoc_bytes, static_defaults, dynamic_defaults, static_size, self.code
+        return (dstoc_bytes, static_defaults, dynamic_defaults,
+                static_size, self.code, clump_records)
 
     def _alloc_temp(self, type_code=TC_SLONG):
         """Allocate a temporary variable. Returns its DSTOC index."""
@@ -607,7 +715,13 @@ class CodeGenerator:
         return self._get_const(value, TC_UWORD)
 
     def _get_var(self, name):
-        """Get or create a user variable. Returns DSTOC index."""
+        """Get or create a user variable. Returns DSTOC index.
+
+        Inside a function body, parameter names resolve to their
+        dedicated DSTOC entries rather than global variables.
+        """
+        if name in self._param_overrides:
+            return self._param_overrides[name]
         if name not in self._vars:
             self._vars[name] = self.ds.add_scalar(TC_SLONG, name=name, default=0, flags=1)
         return self._vars[name]
@@ -678,6 +792,8 @@ class CodeGenerator:
             self._emit_repeat(stmt)
         elif isinstance(stmt, Forever):
             self._emit_forever(stmt)
+        elif isinstance(stmt, FuncCallStmt):
+            self._emit_func_call(stmt)
         else:
             raise ValueError(f"Unknown statement: {type(stmt).__name__}")
 
@@ -960,6 +1076,28 @@ class CodeGenerator:
         ms_idx = self._emit_expr(stmt.milliseconds)
         self._emit(encode_instruction(OP_WAIT, ms_idx))
 
+    # ── Function calls ─────────────────────────────────────────────────
+
+    def _emit_func_call(self, stmt: FuncCallStmt):
+        """Emit a user function call: copy args to params, then OP_SUBCALL."""
+        if stmt.name not in self._funcs:
+            raise ValueError(f"Unknown function: '{stmt.name}'")
+        finfo = self._funcs[stmt.name]
+
+        if len(stmt.args) != len(finfo["params"]):
+            raise ValueError(
+                f"Function '{stmt.name}' expects {len(finfo['params'])} "
+                f"argument(s), got {len(stmt.args)}")
+
+        # Copy argument values into parameter slots
+        for arg_expr, param_idx in zip(stmt.args, finfo["param_indices"]):
+            arg_val = self._emit_expr(arg_expr)
+            self._emit(encode_instruction(OP_MOV, param_idx, arg_val))
+
+        # Call the subroutine clump
+        self._emit(encode_instruction(
+            OP_SUBCALL, finfo["clump_id"], finfo["caller_ret"]))
+
     # ── Control flow ────────────────────────────────────────────────────
 
     def _emit_if_else(self, stmt: IfElse):
@@ -1100,8 +1238,10 @@ def compile_source(source: str, output_path: str) -> str:
 
     tokens = lex(source)
     parser = Parser(tokens)
-    ast = parser.parse()
+    func_defs, main_stmts = parser.parse()
     gen = CodeGenerator()
-    dstoc_bytes, static_defaults, dynamic_defaults, ds_static_size, code_words = gen.compile(ast)
-    write_rxe(dstoc_bytes, static_defaults, dynamic_defaults, ds_static_size, code_words, output_path)
+    (dstoc_bytes, static_defaults, dynamic_defaults,
+     ds_static_size, code_words, clump_records) = gen.compile(func_defs, main_stmts)
+    write_rxe(dstoc_bytes, static_defaults, dynamic_defaults,
+              ds_static_size, code_words, output_path, clump_records)
     return output_path

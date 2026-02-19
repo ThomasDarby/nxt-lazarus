@@ -27,7 +27,7 @@ COLORS = {
 }
 
 # Keyword groups for highlighting
-FLOW_KEYWORDS = {"if", "else", "end", "repeat", "forever"}
+FLOW_KEYWORDS = {"if", "else", "end", "repeat", "forever", "def"}
 BUILTIN_KEYWORDS = {
     "motor", "touch", "light", "sound", "ultrasonic",
     "on", "off", "coast", "play_tone", "display", "clear_screen", "wait",
@@ -82,6 +82,22 @@ CONTROL FLOW
   forever:            Loop forever
       motor(A).on(50)
   end
+
+FUNCTIONS
+  def turn_right:       Define a function (no parameters)
+      motor(B).on(50)
+      motor(C).on(-50)
+      wait(600)
+  end
+
+  def drive(power):     Define with parameters
+      motor(B).on(power)
+      motor(C).on(power)
+  end
+
+  drive(75)             Call a function
+  turn_right()          Call with no arguments
+  Note: no recursion (NXT hardware limitation).
 
 COMMENTS
   # This is a comment
@@ -161,6 +177,39 @@ forever:
         motor(C).on(75)
     end
 end
+""",
+    "Functions Demo": """\
+# Functions Demo
+# Define reusable actions for your robot
+
+def drive(power, duration):
+    motor(B).on(power)
+    motor(C).on(power)
+    wait(duration)
+    motor(B).off()
+    motor(C).off()
+end
+
+def turn_right:
+    motor(B).on(50)
+    motor(C).on(-50)
+    wait(600)
+    motor(B).off()
+    motor(C).off()
+end
+
+def beep:
+    play_tone(880, 150)
+    wait(200)
+end
+
+# Drive in a triangle
+repeat 3:
+    beep()
+    drive(75, 1500)
+    turn_right()
+end
+beep()
 """,
     "Line Follower": """\
 # Simple Line Follower

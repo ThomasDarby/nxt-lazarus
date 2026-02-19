@@ -46,7 +46,7 @@ VERSION = 0x0005  # version 5.0
 
 
 def write_rxe(dstoc_bytes, static_defaults, dynamic_defaults,
-              ds_static_size, code_words, output_path):
+              ds_static_size, code_words, output_path, clump_records=None):
     """Write a complete .rxe file.
 
     Args:
@@ -56,16 +56,24 @@ def write_rxe(dstoc_bytes, static_defaults, dynamic_defaults,
         ds_static_size: Size of static portion of dataspace
         code_words: List of signed 16-bit words (the codespace)
         output_path: Path to write the .rxe file
+        clump_records: List of (fire_count, dep_count, code_start_offset) tuples.
+                       Defaults to a single main clump if None.
     """
+    if clump_records is None:
+        clump_records = [(1, 0, 0)]
+
     dstoc_count = len(dstoc_bytes) // 4
     codespace_count = len(code_words)
-    clump_count = 1  # single-clump programs for now
+    clump_count = len(clump_records)
 
     # Dynamic defaults start right after static data in the dataspace
     dv_array_offset = ds_static_size  # dope vectors are at the start of dynamic area
 
-    # Clump record: single clump, fire count 1, no dependents, code starts at word 0
-    clump_record = struct.pack("<BBH", 1, 0, 0)
+    # Pack clump records
+    clump_record = b"".join(
+        struct.pack("<BBH", fc, dc, cs)
+        for fc, dc, cs in clump_records
+    )
 
     # Build header
     header = bytearray()
