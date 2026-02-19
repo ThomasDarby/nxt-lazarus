@@ -1,0 +1,27 @@
+# Obstacle Avoider
+# Ultrasonic sensor on port 4 detects walls
+# Motors B and C for driving
+
+forever:
+    if ultrasonic(4) < 30:
+        # Object detected! Stop, beep, back up, and turn
+        motor(B).off()
+        motor(C).off()
+        play_tone(880, 200)
+        wait(500)
+
+        # Back up
+        motor(B).on(-50)
+        motor(C).on(-50)
+        wait(1000)
+
+        # Turn right
+        motor(B).on(50)
+        motor(C).on(-50)
+        wait(600)
+    else:
+        # No obstacle — drive forward
+        motor(B).on(75)
+        motor(C).on(75)
+    end
+end

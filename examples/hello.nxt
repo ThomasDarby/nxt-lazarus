@@ -1,0 +1,14 @@
+# Hello World
+# Play a tune and show a message on the NXT display
+
+clear_screen()
+display("Hello!", 1)
+display("NXT Toolkit", 3)
+
+# Play a little melody
+play_tone(523, 200)
+wait(300)
+play_tone(659, 200)
+wait(300)
+play_tone(784, 400)
+wait(2000)

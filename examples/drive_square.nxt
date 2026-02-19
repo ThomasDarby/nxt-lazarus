@@ -1,0 +1,29 @@
+# Drive in a Square
+# Attach motors to ports B and C
+# The robot drives forward, turns right, and repeats 4 times
+
+repeat 4:
+    # Drive forward
+    motor(B).on(75)
+    motor(C).on(75)
+    wait(1500)
+
+    # Stop
+    motor(B).off()
+    motor(C).off()
+    wait(200)
+
+    # Turn right
+    motor(B).on(50)
+    motor(C).on(-50)
+    wait(800)
+
+    # Stop
+    motor(B).off()
+    motor(C).off()
+    wait(200)
+end
+
+# Coast motors when done
+motor(B).coast()
+motor(C).coast()

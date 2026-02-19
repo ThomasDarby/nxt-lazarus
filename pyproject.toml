@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "nxt-toolkit"
+version = "0.1.0"
+description = "Write, compile, and upload programs to LEGO NXT Mindstorms"
+requires-python = ">=3.10"
+dependencies = ["pyusb>=1.2.1"]
+
+[project.scripts]
+nxt-toolkit = "nxt_toolkit.app:main"
+
+[project.gui-scripts]
+nxt-toolkit-gui = "nxt_toolkit.app:main"
