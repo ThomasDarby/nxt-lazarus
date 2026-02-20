@@ -26,7 +26,7 @@ jobs:
         run: |
           LIBUSB="$(brew --prefix libusb)/lib/libusb-1.0.dylib"
           pyinstaller \
-            --name "NXT Toolkit" \
+            --name "NXT Lazarus" \
             --windowed \
             --onedir \
             --noconfirm \
@@ -40,23 +40,24 @@ jobs:
             --hidden-import nxt_toolkit.dataspace \
             --hidden-import nxt_toolkit.rxe_writer \
             --hidden-import nxt_toolkit.usb \
+            --icon icon.icns \
             --osx-bundle-identifier com.nxttoolkit.app \
             nxt_toolkit/app.py
 
       - name: Create DMG
         run: |
           hdiutil create \
-            -volname "NXT Toolkit" \
-            -srcfolder "dist/NXT Toolkit.app" \
+            -volname "NXT Lazarus" \
+            -srcfolder "dist/NXT Lazarus.app" \
             -ov \
             -format UDZO \
-            "dist/NXT-Toolkit.dmg"
+            "dist/NXT-Lazarus.dmg"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            "dist/NXT-Toolkit.dmg" \
-            --title "NXT Toolkit $GITHUB_REF_NAME" \
+            "dist/NXT-Lazarus.dmg" \
+            --title "NXT Lazarus $GITHUB_REF_NAME" \
             --generate-notes

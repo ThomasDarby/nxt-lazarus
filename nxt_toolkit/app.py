@@ -1,4 +1,4 @@
-"""NXT Toolkit — tkinter desktop GUI.
+"""NXT Lazarus — tkinter desktop GUI.
 
 Main window with code editor, toolbar, output panel, and NXT connection status.
 """
@@ -38,7 +38,7 @@ BUILTIN_KEYWORDS = {
 PORT_KEYWORDS = {"A", "B", "C"}
 
 SYNTAX_HELP = """\
-NXT Toolkit — Language Reference
+NXT Lazarus — Language Reference
 
 MOTORS
   motor(A).on(75)     Turn motor A on at 75% power
@@ -113,7 +113,7 @@ EXAMPLES = {
 # Play a tone and show a message
 clear_screen()
 display("Hello!", 1)
-display("NXT Toolkit", 3)
+display("NXT Lazarus", 3)
 play_tone(523, 200)
 wait(300)
 play_tone(659, 200)
@@ -239,7 +239,7 @@ class NXTToolkitApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("NXT Toolkit")
+        self.root.title("NXT Lazarus")
         self.root.geometry("800x650")
 
         # Track current file
@@ -410,7 +410,7 @@ class NXTToolkitApp:
         self.editor.delete("1.0", tk.END)
         self._current_file = None
         self._modified = False
-        self.root.title("NXT Toolkit")
+        self.root.title("NXT Lazarus")
 
     def _open_file(self):
         path = filedialog.askopenfilename(
@@ -423,7 +423,7 @@ class NXTToolkitApp:
             self.editor.insert("1.0", content)
             self._current_file = path
             self._modified = False
-            self.root.title(f"NXT Toolkit — {os.path.basename(path)}")
+            self.root.title(f"NXT Lazarus — {os.path.basename(path)}")
             self._highlight_all()
 
     def _save_file(self):
@@ -439,7 +439,7 @@ class NXTToolkitApp:
         if path:
             self._write_file(path)
             self._current_file = path
-            self.root.title(f"NXT Toolkit — {os.path.basename(path)}")
+            self.root.title(f"NXT Lazarus — {os.path.basename(path)}")
 
     def _write_file(self, path):
         content = self.editor.get("1.0", tk.END)
@@ -454,7 +454,7 @@ class NXTToolkitApp:
         self.editor.insert("1.0", EXAMPLES[name])
         self._current_file = None
         self._modified = False
-        self.root.title(f"NXT Toolkit — {name}")
+        self.root.title(f"NXT Lazarus — {name}")
         self._highlight_all()
 
     # ── Compile / Upload / Run ──────────────────────────────────────────
@@ -620,7 +620,7 @@ class NXTToolkitApp:
 
     def _show_help(self):
         win = tk.Toplevel(self.root)
-        win.title("NXT Toolkit — Language Reference")
+        win.title("NXT Lazarus — Language Reference")
         win.geometry("600x500")
 
         text = scrolledtext.ScrolledText(
@@ -633,8 +633,8 @@ class NXTToolkitApp:
 
     def _show_about(self):
         messagebox.showinfo(
-            "About NXT Toolkit",
-            "NXT Toolkit v0.1.0\n\n"
+            "About NXT Lazarus",
+            "NXT Lazarus v0.1.0\n\n"
             "Write, compile, and upload programs\n"
             "to LEGO NXT Mindstorms bricks.\n\n"
             "No LEGO software required.")
@@ -719,7 +719,7 @@ def main():
         app.editor.delete("1.0", tk.END)
         app.editor.insert("1.0", content)
         app._current_file = sys.argv[1]
-        app.root.title(f"NXT Toolkit — {os.path.basename(sys.argv[1])}")
+        app.root.title(f"NXT Lazarus — {os.path.basename(sys.argv[1])}")
         app._highlight_all()
 
     root.mainloop()

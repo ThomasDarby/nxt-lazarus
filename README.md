@@ -1,8 +1,8 @@
-# NXT Toolkit
+# NXT Lazarus
 
 Write, compile, and upload programs to LEGO NXT Mindstorms from modern macOS — no legacy software needed.
 
-NXT Toolkit is a standalone desktop app with a built-in code editor, compiler, and USB uploader. It uses a simple, Python-like language that compiles directly to NXT bytecode (`.rxe` files).
+NXT Lazarus is a standalone desktop app with a built-in code editor, compiler, and USB uploader. It uses a simple, Python-like language that compiles directly to NXT bytecode (`.rxe` files).
 
 ## Quick Start
 
@@ -16,7 +16,7 @@ Or build a standalone `.app`:
 ```bash
 pip install pyinstaller pyusb
 brew install libusb
-./build_app.sh        # produces dist/NXT Toolkit.app
+./build_app.sh        # produces dist/NXT Lazarus.app
 ```
 
 ## The Language

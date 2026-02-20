@@ -3,7 +3,7 @@
 
 clear_screen()
 display("Hello!", 1)
-display("NXT Toolkit", 3)
+display("NXT Lazarus", 3)
 
 # Play a little melody
 play_tone(523, 200)
