@@ -936,7 +936,8 @@ def _run_nbc(nxc_source: str, output_path: str):
 
     try:
         result = subprocess.run(
-            [nbc_path, nxc_path, f"-O={output_path}", f"-I={include_dir}"],
+            [nbc_path, nxc_path, f"-O={output_path}", f"-I={include_dir}",
+             "-v=105"],
             capture_output=True,
             text=True,
             timeout=30,
