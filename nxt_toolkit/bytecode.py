@@ -204,44 +204,41 @@ SYSCALL_SOUND_SET_STATE   = 12
 SYSCALL_DRAW_TEXT         = 13
 SYSCALL_DRAW_POINT        = 14
 SYSCALL_DRAW_LINE         = 15
-SYSCALL_DRAW_RECT         = 16
-SYSCALL_DRAW_CIRCLE       = 17
-SYSCALL_SET_SCREEN_MODE   = 18
-SYSCALL_READ_BUTTON       = 19
-SYSCALL_COMM_LS_WRITE     = 20
-SYSCALL_COMM_LS_READ      = 21
-SYSCALL_COMM_LS_CHECKSTATUS = 22
-SYSCALL_RANDOM_NUMBER     = 23
-SYSCALL_GET_START_TICK    = 24
-SYSCALL_MESSAGE_WRITE     = 25
-SYSCALL_MESSAGE_READ      = 26
-SYSCALL_COMM_BT_CHECK_STATUS = 27
-SYSCALL_COMM_BT_WRITE    = 28
-SYSCALL_KEEP_ALIVE        = 31
-SYSCALL_IOMAP_READ        = 32
-SYSCALL_IOMAP_WRITE       = 33
-SYSCALL_CLEAR_SCREEN      = 38  # NXT 2.0 firmware
+SYSCALL_DRAW_CIRCLE       = 16
+SYSCALL_DRAW_RECT         = 17
+SYSCALL_DRAW_PICTURE      = 18
+SYSCALL_SET_SCREEN_MODE   = 19
+SYSCALL_READ_BUTTON       = 20
+SYSCALL_COMM_LS_WRITE     = 21
+SYSCALL_COMM_LS_READ      = 22
+SYSCALL_COMM_LS_CHECKSTATUS = 23
+SYSCALL_RANDOM_NUMBER     = 24
+SYSCALL_GET_START_TICK    = 25
+SYSCALL_MESSAGE_WRITE     = 26
+SYSCALL_MESSAGE_READ      = 27
+SYSCALL_COMM_BT_CHECK_STATUS = 28
+SYSCALL_COMM_BT_WRITE     = 29
+SYSCALL_COMM_BT_READ      = 30
+SYSCALL_KEEP_ALIVE         = 31
+SYSCALL_IOMAP_READ         = 32
+SYSCALL_IOMAP_WRITE        = 33
 
 # ── Instruction encoding ────────────────────────────────────────────────────
 
 # Instruction format (16-bit word):
-#   Bits 15-12: size in bytes (encoded: 0=4, 1=6, 2=8, 3=10, 0xE=variable)
+#   Bits 15-12: size nibble (= total instruction size in bytes, used as
+#               direct index into firmware's InterpFuncs[] dispatch table)
 #   Bits 10-8:  comparison code (for CMP/BRCMP/BRTST)
 #   Bits 7-0:   opcode
+#
+# Valid size nibbles: 4, 6, 8, 10(0xA), 12(0xC) for fixed-size; 0xE for variable.
+# All other values (0-3, odd, 0xF) dispatch to cCmdInterpNoArg → ERR_INSTR.
 
-# Size encoding: the high nibble encodes the total instruction size
-# 0x0xxx = 4 bytes (opcode word + 1 operand)
-# 0x1xxx = 6 bytes (opcode word + 2 operands)
-# 0x2xxx = 8 bytes (opcode word + 3 operands)
-# 0x3xxx = 10 bytes (opcode word + 4 operands)
-# 0xExxx = variable length (opcode word + count byte + N operands)
-
-SIZE_4  = 0x0  # 2 bytes total: instruction word + 0 extra words (1 operand in spec = 4 bytes)
-SIZE_6  = 0x1  # 3 words total
-SIZE_8  = 0x2  # 4 words total
-SIZE_10 = 0x3  # 5 words total
-SIZE_12 = 0x4  # 6 words total
-SIZE_14 = 0x5  # 7 words total
+SIZE_4  = 0x4  # 4 bytes: instruction word + 1 operand
+SIZE_6  = 0x6  # 6 bytes: instruction word + 2 operands
+SIZE_8  = 0x8  # 8 bytes: instruction word + 3 operands
+SIZE_10 = 0xA  # 10 bytes: instruction word + 4 operands
+SIZE_12 = 0xC  # 12 bytes: instruction word + 5 operands
 SIZE_VAR = 0xE  # variable-length
 
 # Instruction sizes (in bytes) for each opcode
@@ -274,12 +271,12 @@ OPCODE_SIZES = {
     OP_STRSUBSET: 10,
     OP_STRTOBYTEARR: 6,
     OP_BYTEARRTOSTR: 6,
-    OP_JMP:   6,
+    OP_JMP:   4,
     OP_BRCMP: 8,
     OP_BRTST: 6,
     OP_SYSCALL: 6,
     OP_STOP:  4,
-    OP_FINCLUMP: 4,
+    OP_FINCLUMP: 6,
     OP_FINCLUMPIMMED: 4,
     OP_ACQUIRE: 4,
     OP_RELEASE: 4,
@@ -290,7 +287,7 @@ OPCODE_SIZES = {
     OP_GETIN: 8,
     OP_GETOUT: 8,
     OP_WAIT:  4,
-    OP_GETTICK: 6,
+    OP_GETTICK: 4,
 }
 
 
@@ -315,19 +312,10 @@ def encode_instruction(opcode, *operands, cc=0, size_bytes=None):
             # 2 bytes for instruction word + 2 bytes per operand
             size_bytes = 2 + 2 * len(operands)
 
-    # Encode the size nibble
-    if size_bytes == 4:
-        size_nibble = 0x0
-    elif size_bytes == 6:
-        size_nibble = 0x1
-    elif size_bytes == 8:
-        size_nibble = 0x2
-    elif size_bytes == 10:
-        size_nibble = 0x3
-    elif size_bytes == 12:
-        size_nibble = 0x4
-    elif size_bytes == 14:
-        size_nibble = 0x5
+    # The size nibble IS the byte count — used as direct index into
+    # the firmware's InterpFuncs[] dispatch table.
+    if size_bytes in (4, 6, 8, 10, 12):
+        size_nibble = size_bytes
     else:
         size_nibble = 0xE  # variable length
 
