@@ -26,11 +26,11 @@ CMD_DIRECT_REPLY    = 0x00  # Direct command, response required
 CMD_SYSTEM_NO_REPLY = 0x81  # System command, no response
 CMD_DIRECT_NO_REPLY = 0x80  # Direct command, no response
 
-# System commands
-SYS_OPEN_WRITE = 0x01
-SYS_WRITE      = 0x03
-SYS_CLOSE      = 0x04
-SYS_DELETE      = 0x06
+# System commands (file operations)
+SYS_OPEN_WRITE_LINEAR = 0x89  # Programs (.rxe) must be linear (contiguous in flash)
+SYS_WRITE      = 0x83
+SYS_CLOSE      = 0x84
+SYS_DELETE      = 0x85
 
 # Direct commands
 DC_START_PROGRAM  = 0x00
@@ -108,20 +108,31 @@ class NXTConnection:
         self._dev.write(NXT_EP_OUT, data, timeout=5000)
 
     def _recv(self, size=64, timeout=5000):
-        """Receive raw bytes from the NXT."""
-        data = self._dev.read(NXT_EP_IN, size, timeout=timeout)
-        return bytes(data)
+        """Receive raw bytes from the NXT.
+
+        Skips phantom short transfers (< 3 bytes) that the NXT firmware
+        occasionally sends between commands.  A valid NXT response is
+        always >= 3 bytes (reply type + command + status).
+        """
+        for _ in range(3):
+            data = self._dev.read(NXT_EP_IN, size, timeout=timeout)
+            result = bytes(data)
+            if len(result) >= 3:
+                return result
+        return result
 
     def _check_status(self, response, cmd_byte):
-        """Check the status byte in an NXT response."""
+        """Check the status byte in an NXT response.
+
+        Note: we only verify byte 0 (reply type) and byte 2 (status).
+        Byte 1 (command echo) is NOT checked because the NXT firmware
+        reuses a shared response buffer and does not reliably update
+        the command byte before sending.
+        """
         if len(response) < 3:
             raise NXTError(f"Response too short: {response.hex()}")
         if response[0] != 0x02:  # Reply byte
             raise NXTError(f"Unexpected reply type: 0x{response[0]:02x}")
-        if response[1] != cmd_byte:
-            raise NXTError(
-                f"Reply for wrong command: expected 0x{cmd_byte:02x}, "
-                f"got 0x{response[1]:02x}")
         status = response[2]
         if status != 0x00:
             status_messages = {
@@ -146,6 +157,20 @@ class NXTConnection:
                 0x91: "Out of bounds",
                 0x92: "Illegal file name",
                 0x93: "Illegal handle",
+                0xBD: "Request failed (communication bus error)",
+                0xBE: "Unknown command opcode",
+                0xBF: "Insane packet",
+                0xC0: "Data contains out-of-range values",
+                0xDD: "Communication bus error",
+                0xDE: "No free memory in communication buffer",
+                0xDF: "Channel/connection not valid or configured",
+                0xE0: "Channel/connection not configured or busy",
+                0xEC: "No active program",
+                0xED: "Illegal size specified",
+                0xEE: "Illegal mailbox queue ID specified",
+                0xEF: "Invalid structure field",
+                0xF0: "Bad input or output specified",
+                0xFF: "Insufficient memory available",
             }
             msg = status_messages.get(status, f"Unknown error 0x{status:02x}")
             raise NXTError(f"NXT error: {msg}")
@@ -158,7 +183,7 @@ class NXTConnection:
         """
         cmd = bytes([CMD_SYSTEM_REPLY, DC_GET_DEVICE_INFO])
         self._send(cmd)
-        resp = self._recv(33)
+        resp = self._recv()
         self._check_status(resp, DC_GET_DEVICE_INFO)
 
         name = resp[3:18].split(b"\x00")[0].decode("ascii", errors="replace")
@@ -172,6 +197,28 @@ class NXTConnection:
             "bt_address": bt_str,
             "signal_strength": signal,
             "free_flash": free_flash,
+        }
+
+    def get_firmware_version(self):
+        """Get NXT firmware and protocol versions.
+
+        Returns:
+            dict with 'protocol_version' and 'firmware_version' as "X.Y" strings.
+        """
+        SYS_GET_FIRMWARE_VERSION = 0x88
+        cmd = bytes([CMD_SYSTEM_REPLY, SYS_GET_FIRMWARE_VERSION])
+        self._send(cmd)
+        resp = self._recv()
+        self._check_status(resp, SYS_GET_FIRMWARE_VERSION)
+
+        proto_minor = resp[3]
+        proto_major = resp[4]
+        fw_minor = resp[5]
+        fw_major = resp[6]
+
+        return {
+            "protocol_version": f"{proto_major}.{proto_minor:02d}",
+            "firmware_version": f"{fw_major}.{fw_minor:02d}",
         }
 
     def delete_file(self, filename):
@@ -189,35 +236,48 @@ class NXTConnection:
             return  # File not found, that's OK
         self._check_status(resp, SYS_DELETE)
 
-    def upload_file(self, local_path, nxt_filename, progress_callback=None):
+    def upload_file(self, local_path, nxt_filename, progress_callback=None,
+                    log=None):
         """Upload a file to the NXT brick.
 
         Args:
             local_path: Path to the local file.
             nxt_filename: Filename to use on the NXT (max 19 chars).
             progress_callback: Optional callable(bytes_sent, total_bytes).
+            log: Optional callable(message) for diagnostic logging.
         """
+        def _log(msg):
+            if log:
+                log(msg)
+
         with open(local_path, "rb") as f:
             data = f.read()
         total_size = len(data)
+        _log(f"File size: {total_size} bytes, NXT name: {nxt_filename}")
 
         # Delete existing file first (ignore errors)
         try:
+            _log("Step 1: Deleting existing file...")
             self.delete_file(nxt_filename)
-        except NXTError:
-            pass
+            _log("Step 1: Delete OK")
+        except NXTError as e:
+            _log(f"Step 1: Delete skipped ({e})")
 
         # Open file for writing
+        _log("Step 2: Opening file for writing...")
         fname_bytes = nxt_filename.encode("ascii")[:19].ljust(20, b"\x00")
-        cmd = bytes([CMD_SYSTEM_REPLY, SYS_OPEN_WRITE]) + fname_bytes
+        cmd = bytes([CMD_SYSTEM_REPLY, SYS_OPEN_WRITE_LINEAR]) + fname_bytes
         cmd += struct.pack("<I", total_size)
         self._send(cmd)
         resp = self._recv()
-        self._check_status(resp, SYS_OPEN_WRITE)
+        _log(f"Step 2: Open response: {resp.hex()}")
+        self._check_status(resp, SYS_OPEN_WRITE_LINEAR)
         handle = resp[3]
+        _log(f"Step 2: Open OK, handle={handle}")
 
         # Write data in chunks
         bytes_sent = 0
+        chunk_num = 0
         try:
             while bytes_sent < total_size:
                 chunk_size = min(MAX_WRITE_PAYLOAD, total_size - bytes_sent)
@@ -227,13 +287,17 @@ class NXTConnection:
                 resp = self._recv()
                 self._check_status(resp, SYS_WRITE)
                 bytes_sent += chunk_size
+                chunk_num += 1
                 if progress_callback:
                     progress_callback(bytes_sent, total_size)
+            _log(f"Step 3: Write OK, {chunk_num} chunks, {bytes_sent} bytes")
         finally:
             # Always close the handle
+            _log("Step 4: Closing file handle...")
             cmd = bytes([CMD_SYSTEM_REPLY, SYS_CLOSE, handle])
             self._send(cmd)
             resp = self._recv()
+            _log(f"Step 4: Close response: {resp.hex()}")
             self._check_status(resp, SYS_CLOSE)
 
     def start_program(self, filename):

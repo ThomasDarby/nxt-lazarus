@@ -86,7 +86,7 @@ class DataspaceBuilder:
 
         Returns the DSTOC index of the array entry.
         """
-        dv_index = len(self._dope_vectors)
+        dv_index = len(self._dope_vectors) + 1  # +1: DV[0] is reserved for the DV array descriptor
 
         # Array entry
         array_idx = len(self.entries)
@@ -152,7 +152,9 @@ class DataspaceBuilder:
             string_defaults = {}
 
         cluster_idx = len(self.entries)
-        num_members = len(scalar_types)
+        # Count total DSTOC entries: scalars = 1 entry each,
+        # arrays = 2 entries each (TC_ARRAY + element type TC_UBYTE).
+        num_members = sum(2 if tc == TC_ARRAY else 1 for tc in scalar_types)
         self.entries.append(DSTOCEntry(TC_CLUSTER, 0, num_members, name))
 
         member_indices = []
@@ -191,46 +193,73 @@ class DataspaceBuilder:
         if static_size % 4:
             static_size += 4 - (static_size % 4)
 
-        # Build static default values
-        static_defaults = bytearray(static_size)
+        # Build compact static defaults stream.
+        # The firmware's cCmdInflateDSDefaults reads defaults SEQUENTIALLY:
+        # for each DSTOC entry in order, if it's a scalar with FL=0, it reads
+        # TYPE_SIZE bytes from the stream. The stream has NO padding or gaps.
+        compact_defaults = bytearray()
         for entry in self.entries:
-            if entry.type_code in TYPE_SIZES and entry.default_value is not None:
+            if entry.type_code in TYPE_SIZES and (entry.flags & 1) == 0:
                 size = TYPE_SIZES[entry.type_code]
-                offset = entry.data_desc
-                if offset + size <= static_size:
-                    fmt = {1: "<B", 2: "<H", 4: "<I"}[size]
-                    if entry.type_code in (TC_SBYTE, TC_SWORD, TC_SLONG):
-                        fmt = fmt.lower()  # signed format
-                    val = entry.default_value & ({1: 0xFF, 2: 0xFFFF, 4: 0xFFFFFFFF}[size])
-                    struct.pack_into(fmt.replace("b", "B").replace("h", "H").replace("i", "I"),
-                                     static_defaults, offset, val)
+                val = entry.default_value if entry.default_value is not None else 0
+                val = val & ({1: 0xFF, 2: 0xFFFF, 4: 0xFFFFFFFF}[size])
+                compact_defaults.extend(struct.pack({1: "<B", 2: "<H", 4: "<I"}[size], val))
+        static_defaults = bytes(compact_defaults)
 
-        # Build dynamic defaults: dope vectors + array initial data
+        # Build dynamic defaults: DV_ARRAY[0] + user dope vectors + array data
+        #
+        # The NXT firmware ALWAYS accesses DV_ARRAY[0], which is a self-describing
+        # dope vector entry for the dope vector array itself. Without it, the
+        # firmware's MemMgr verification fails with ERR_FILE.
         dynamic_data = bytearray()
 
-        # Dope vectors come first in dynamic memory
-        dv_base_offset = static_size
-        num_dv = len(self._dope_vectors)
+        num_user_dv = len(self._dope_vectors)
+        total_dv_count = 1 + num_user_dv  # DV_ARRAY[0] + user DVs
 
-        # Reserve space for all dope vectors
-        for _ in self._dope_vectors:
+        # Reserve space for ALL dope vectors (DV_ARRAY[0] + user DVs)
+        for _ in range(total_dv_count):
             dynamic_data.extend(b"\x00" * DOPE_VECTOR_SIZE)
 
-        # Now append array data and fill in dope vectors
+        # Append array data and fill in user dope vectors (indices 1+)
         for i, dv in enumerate(self._dope_vectors):
             data_offset = static_size + len(dynamic_data)
             data = dv["data"]
             dynamic_data.extend(data)
 
-            # Fill in the dope vector
-            # DopeVector format: offset(UWORD), elem_size(UWORD), count(UWORD), back_ptr(UWORD), link(UWORD)
-            dv_offset = i * DOPE_VECTOR_SIZE
-            struct.pack_into("<HHHHH", dynamic_data, dv_offset,
+            # Link to next user DV, or 0xFFFF for the last one
+            next_link = (i + 2) if i < num_user_dv - 1 else 0xFFFF
+
+            dv_byte_offset = (i + 1) * DOPE_VECTOR_SIZE  # +1 to skip DV_ARRAY[0]
+            struct.pack_into("<HHHHH", dynamic_data, dv_byte_offset,
                              data_offset,           # offset to array data
                              dv["elem_size"],        # element size
                              dv["elem_count"],       # element count
-                             0,                      # back pointer (unused, 0)
-                             0xFFFF)                 # link index (0xFFFF = no link)
+                             0,                      # back pointer
+                             next_link)              # link to next DV
+
+        # MemMgr head/tail and DV_ARRAY[0].Count
+        #
+        # cCmdVerifyMemMgr walks the linked list from MemMgrHead and counts
+        # entries, then checks: DVCount == DV_ARRAY[0].Count.
+        #
+        # When there ARE user DVs: list is DV[1]→...→DV[N], Count=N
+        # When there are NO user DVs: DV[0] itself is the sole list entry,
+        #   Head=0, Tail=0, Count=1 (verified against mtest.rxe from NBC)
+        if num_user_dv > 0:
+            mem_mgr_head = 1
+            mem_mgr_tail = num_user_dv
+            dv0_count = num_user_dv
+        else:
+            mem_mgr_head = 0
+            mem_mgr_tail = 0
+            dv0_count = 1
+
+        struct.pack_into("<HHHHH", dynamic_data, 0,
+                         static_size,            # offset (= DVArrayOffset)
+                         DOPE_VECTOR_SIZE,        # elem_size
+                         dv0_count,              # count: managed DVs in the list
+                         0xFFFF,                  # back pointer (NOT_A_DS_ID)
+                         0xFFFF)                  # link (end of list)
 
         # Total initial dataspace size
         ds_initial_size = static_size + len(dynamic_data)
@@ -239,4 +268,4 @@ class DataspaceBuilder:
         dstoc_bytes = b"".join(entry.pack() for entry in self.entries)
 
         return (dstoc_bytes, bytes(static_defaults), bytes(dynamic_data),
-                static_size, ds_initial_size)
+                static_size, ds_initial_size, mem_mgr_head, mem_mgr_tail)

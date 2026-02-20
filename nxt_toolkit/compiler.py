@@ -1,6 +1,6 @@
 """Compiler for the NXT Toolkit DSL.
 
-Pipeline: Source → Lexer → Parser → AST → Code Generator → (DSTOC + bytecode)
+Pipeline: Source → Lexer → Parser → AST → NXCEmitter → .nxc text → nbc → .rxe
 
 The DSL is a simplified Python-like language:
 
@@ -19,36 +19,13 @@ The DSL is a simplified Python-like language:
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from typing import Union
-
-from .bytecode import (
-    TC_UBYTE, TC_SBYTE, TC_UWORD, TC_SWORD, TC_ULONG, TC_SLONG,
-    TC_ARRAY, TC_CLUSTER,
-    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_NEG,
-    OP_MOV, OP_SET, OP_CMP, OP_TST,
-    OP_JMP, OP_BRCMP, OP_BRTST,
-    OP_SYSCALL, OP_STOP, OP_WAIT,
-    OP_SUBCALL, OP_SUBRET,
-    OP_SETIN, OP_SETOUT, OP_GETIN,
-    CC_LT, CC_GT, CC_LTEQ, CC_GTEQ, CC_EQ, CC_NEQ,
-    SENSOR_TYPE_TOUCH, SENSOR_TYPE_LIGHT_ACTIVE, SENSOR_TYPE_SOUND_DB,
-    SENSOR_TYPE_LOWSPEED_9V,
-    SENSOR_MODE_BOOLEAN, SENSOR_MODE_PCTFULLSCALE, SENSOR_MODE_RAW,
-    IN_TYPE, IN_MODE, IN_SCALED, IN_INVALID,
-    OUT_FLAGS, OUT_MODE, OUT_SPEED, OUT_RUN_STATE, OUT_REG_MODE,
-    OUT_UPDATE_MODE, OUT_UPDATE_SPEED,
-    OUT_MODE_COAST, OUT_MODE_MOTORON, OUT_MODE_BRAKE, OUT_MODE_REGULATED,
-    OUT_RUNSTATE_IDLE, OUT_RUNSTATE_RUNNING,
-    OUT_REGMODE_IDLE, OUT_REGMODE_SPEED,
-    MOTOR_A, MOTOR_B, MOTOR_C,
-    SYSCALL_SOUND_PLAY_TONE, SYSCALL_DRAW_TEXT, SYSCALL_CLEAR_SCREEN,
-    SYSCALL_COMM_LS_WRITE, SYSCALL_COMM_LS_READ, SYSCALL_COMM_LS_CHECKSTATUS,
-    SIZE_VAR,
-    encode_instruction, _to_i16, words_to_bytes,
-)
-from .dataspace import DataspaceBuilder
 
 
 # ─── Lexer ──────────────────────────────────────────────────────────────────
@@ -622,606 +599,376 @@ class Parser:
         return SensorCall(sensor_type=sensor_tok.value, port=port)
 
 
-# ─── Code Generator ─────────────────────────────────────────────────────────
+# ─── NXC Emitter ─────────────────────────────────────────────────────────────
 
-class CodeGenerator:
-    """Walk the AST and emit DSTOC entries + bytecode."""
+class NXCEmitter:
+    """Walk the AST and emit NXC (Not eXactly C) source code."""
 
-    def __init__(self):
-        self.ds = DataspaceBuilder()
-        self.code: list[int] = []  # signed 16-bit words
-        self._vars: dict[str, int] = {}  # variable name → DSTOC index
-        self._consts: dict[int, int] = {}  # constant value → DSTOC index
-        self._temp_counter = 0
-        self._sensor_configured: set[int] = set()  # ports we've configured
-        self._funcs: dict[str, dict] = {}  # function name → info
-        self._param_overrides: dict[str, int] = {}  # active parameter scope
+    LCD_LINES = {
+        1: "LCD_LINE1", 2: "LCD_LINE2", 3: "LCD_LINE3", 4: "LCD_LINE4",
+        5: "LCD_LINE5", 6: "LCD_LINE6", 7: "LCD_LINE7", 8: "LCD_LINE8",
+    }
 
-        # Pre-allocate commonly needed constants
-        self._const_zero = self._get_const(0)
-        self._const_one = self._get_const(1)
+    MOTOR_PORTS = {"A": "OUT_A", "B": "OUT_B", "C": "OUT_C"}
 
-    def compile(self, func_defs: list, main_stmts: list):
-        """Compile function definitions and main statements.
+    SENSOR_PORTS = {1: "IN_1", 2: "IN_2", 3: "IN_3", 4: "IN_4"}
 
-        Returns: (dstoc_bytes, static_defaults, dynamic_defaults,
-                  ds_static_size, code_words, clump_records)
-        """
-        # Phase 1: Register all functions (allocate DSTOC entries)
-        for i, fdef in enumerate(func_defs):
-            clump_id = i + 1  # Clump 0 = main program
-            caller_ret = self.ds.add_scalar(
-                TC_SWORD, name=f"__ret_{fdef.name}", default=0, flags=1)
-            param_indices = []
-            for pname in fdef.params:
-                pidx = self.ds.add_scalar(
-                    TC_SLONG, name=f"__p_{fdef.name}_{pname}",
-                    default=0, flags=1)
-                param_indices.append(pidx)
-            self._funcs[fdef.name] = {
-                "clump_id": clump_id,
-                "caller_ret": caller_ret,
-                "params": fdef.params,
-                "param_indices": param_indices,
-            }
+    def emit(self, func_defs: list, main_stmts: list) -> str:
+        """Emit a complete NXC source file from parsed AST."""
+        self._variables: set[str] = set()
+        self._sensors: dict[tuple[str, int], None] = {}  # (type, port) → None
+        self._func_params: dict[str, list[str]] = {}
+        self._lines: list[str] = []
 
-        # Phase 2: Compile main body (clump 0)
-        clump_records = []
-        main_start = self._current_offset()
-        for stmt in main_stmts:
-            self._emit_stmt(stmt)
-        self.code.extend(encode_instruction(OP_STOP, 0))
-        clump_records.append((1, 0, main_start))
-
-        # Phase 3: Compile each function body
+        # Register function parameter names so prescan doesn't treat them as globals
         for fdef in func_defs:
-            finfo = self._funcs[fdef.name]
-            func_start = self._current_offset()
-            clump_records.append((1, 0, func_start))
+            self._func_params[fdef.name] = fdef.params
 
-            # Set up parameter scope
-            self._param_overrides = {
-                pname: pidx
-                for pname, pidx in zip(fdef.params, finfo["param_indices"])
-            }
+        # Pre-scan to collect variables and sensors used
+        for fdef in func_defs:
+            self._prescan_stmts(fdef.body, exclude_vars=set(fdef.params))
+        self._prescan_stmts(main_stmts)
 
-            for stmt in fdef.body:
-                self._emit_stmt(stmt)
+        # Emit function definitions
+        for fdef in func_defs:
+            self._emit_func_def(fdef)
+            self._lines.append("")
 
-            self.code.extend(encode_instruction(OP_SUBRET, finfo["caller_ret"]))
-            self._param_overrides = {}
+        # Emit task main
+        self._lines.append("task main() {")
 
-        dstoc_bytes, static_defaults, dynamic_defaults, static_size, _ = self.ds.serialize()
-        return (dstoc_bytes, static_defaults, dynamic_defaults,
-                static_size, self.code, clump_records)
+        # Sensor setup at top of main
+        for sensor_type, port in self._sensors:
+            nxc_port = self.SENSOR_PORTS[port]
+            if sensor_type == "touch":
+                self._lines.append(f"  SetSensorTouch({nxc_port});")
+            elif sensor_type == "light":
+                self._lines.append(f"  SetSensorLight({nxc_port});")
+            elif sensor_type == "sound":
+                self._lines.append(f"  SetSensorSound({nxc_port});")
+            elif sensor_type == "ultrasonic":
+                self._lines.append(f"  SetSensorLowspeed({nxc_port});")
 
-    def _alloc_temp(self, type_code=TC_SLONG):
-        """Allocate a temporary variable. Returns its DSTOC index."""
-        name = f"__tmp{self._temp_counter}"
-        self._temp_counter += 1
-        return self.ds.add_scalar(type_code, name=name, default=0, flags=1)
+        # Variable declarations at top of main
+        for var in sorted(self._variables):
+            self._lines.append(f"  int {var};")
 
-    def _get_const(self, value, type_code=TC_SLONG):
-        """Get or create a constant with the given value. Returns DSTOC index."""
-        key = (value, type_code)
-        if key not in self._consts:
-            self._consts[key] = self.ds.add_constant(type_code, value, name=f"const_{value}")
-        return self._consts[key]
+        if self._sensors or self._variables:
+            self._lines.append("")
 
-    def _get_const_ubyte(self, value):
-        return self._get_const(value, TC_UBYTE)
+        # Main body statements
+        for stmt in main_stmts:
+            self._emit_stmt(stmt, indent=1)
 
-    def _get_const_uword(self, value):
-        return self._get_const(value, TC_UWORD)
+        self._lines.append("}")
+        return "\n".join(self._lines) + "\n"
 
-    def _get_var(self, name):
-        """Get or create a user variable. Returns DSTOC index.
+    # ── Pre-scan ─────────────────────────────────────────────────────────
 
-        Inside a function body, parameter names resolve to their
-        dedicated DSTOC entries rather than global variables.
-        """
-        if name in self._param_overrides:
-            return self._param_overrides[name]
-        if name not in self._vars:
-            self._vars[name] = self.ds.add_scalar(TC_SLONG, name=name, default=0, flags=1)
-        return self._vars[name]
+    def _prescan_stmts(self, stmts: list, exclude_vars: set[str] | None = None):
+        """Walk statements to collect variable names and sensor ports."""
+        for stmt in stmts:
+            self._prescan_node(stmt, exclude_vars or set())
 
-    def _emit(self, words):
-        """Append instruction words to the codespace."""
-        self.code.extend(words)
+    def _prescan_node(self, node, exclude_vars: set[str]):
+        if isinstance(node, Assignment):
+            if node.name not in exclude_vars:
+                self._variables.add(node.name)
+            self._prescan_node(node.expr, exclude_vars)
+        elif isinstance(node, SensorCall):
+            self._sensors[(node.sensor_type, node.port)] = None
+        elif isinstance(node, BinOp):
+            self._prescan_node(node.left, exclude_vars)
+            self._prescan_node(node.right, exclude_vars)
+        elif isinstance(node, UnaryNeg):
+            self._prescan_node(node.expr, exclude_vars)
+        elif isinstance(node, CompareExpr):
+            self._prescan_node(node.left, exclude_vars)
+            self._prescan_node(node.right, exclude_vars)
+        elif isinstance(node, MotorOn):
+            self._prescan_node(node.power, exclude_vars)
+        elif isinstance(node, PlayTone):
+            self._prescan_node(node.freq, exclude_vars)
+            self._prescan_node(node.duration, exclude_vars)
+        elif isinstance(node, Display):
+            self._prescan_node(node.text, exclude_vars)
+            self._prescan_node(node.line, exclude_vars)
+        elif isinstance(node, Wait):
+            self._prescan_node(node.milliseconds, exclude_vars)
+        elif isinstance(node, IfElse):
+            self._prescan_node(node.condition, exclude_vars)
+            for s in node.then_body:
+                self._prescan_node(s, exclude_vars)
+            for s in node.else_body:
+                self._prescan_node(s, exclude_vars)
+        elif isinstance(node, Repeat):
+            self._prescan_node(node.count, exclude_vars)
+            for s in node.body:
+                self._prescan_node(s, exclude_vars)
+        elif isinstance(node, Forever):
+            for s in node.body:
+                self._prescan_node(s, exclude_vars)
+        elif isinstance(node, FuncCallStmt):
+            for arg in node.args:
+                self._prescan_node(arg, exclude_vars)
 
-    def _current_offset(self):
-        """Current word offset in the codespace."""
-        return len(self.code)
+    # ── Expression emission ──────────────────────────────────────────────
 
-    # ── Expression evaluation ───────────────────────────────────────────
-
-    def _emit_expr(self, node) -> int:
-        """Emit code for an expression, return DSTOC index of result."""
+    def _emit_expr(self, node) -> str:
+        """Recursively convert an expression AST node to an NXC string."""
         if isinstance(node, NumberLit):
-            return self._get_const(node.value)
-
+            return str(node.value)
         if isinstance(node, StringLit):
-            return self.ds.add_string(node.value, name=f"str_{node.value[:8]}")
-
+            escaped = node.value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'"{escaped}"'
         if isinstance(node, VarRef):
-            return self._get_var(node.name)
-
+            return node.name
         if isinstance(node, UnaryNeg):
-            inner = self._emit_expr(node.expr)
-            result = self._alloc_temp()
-            self._emit(encode_instruction(OP_NEG, result, inner))
-            return result
-
+            return f"(-{self._emit_expr(node.expr)})"
         if isinstance(node, BinOp):
             left = self._emit_expr(node.left)
             right = self._emit_expr(node.right)
-            result = self._alloc_temp()
-            op_map = {"+": OP_ADD, "-": OP_SUB, "*": OP_MUL, "/": OP_DIV, "%": OP_MOD}
-            opcode = op_map[node.op]
-            self._emit(encode_instruction(opcode, result, left, right))
-            return result
-
+            return f"({left} {node.op} {right})"
         if isinstance(node, SensorCall):
-            return self._emit_sensor_read(node)
-
+            nxc_port = self.SENSOR_PORTS[node.port]
+            if node.sensor_type == "ultrasonic":
+                return f"SensorUS({nxc_port})"
+            return f"Sensor({nxc_port})"
         raise ValueError(f"Unknown expression node: {type(node).__name__}")
 
-    # ── Statement emission ──────────────────────────────────────────────
+    # ── Statement emission ───────────────────────────────────────────────
 
-    def _emit_stmt(self, stmt):
+    def _emit_stmt(self, stmt, indent: int = 0):
+        """Emit NXC lines for a statement."""
+        pad = "  " * indent
+
         if isinstance(stmt, Assignment):
-            self._emit_assignment(stmt)
+            expr = self._emit_expr(stmt.expr)
+            self._lines.append(f"{pad}{stmt.name} = {expr};")
+
         elif isinstance(stmt, MotorOn):
-            self._emit_motor_on(stmt)
+            port = self.MOTOR_PORTS[stmt.port]
+            power = self._emit_expr(stmt.power)
+            self._lines.append(f"{pad}OnFwd({port}, {power});")
+
         elif isinstance(stmt, MotorOff):
-            self._emit_motor_off(stmt)
+            port = self.MOTOR_PORTS[stmt.port]
+            self._lines.append(f"{pad}Off({port});")
+
         elif isinstance(stmt, MotorCoast):
-            self._emit_motor_coast(stmt)
+            port = self.MOTOR_PORTS[stmt.port]
+            self._lines.append(f"{pad}Float({port});")
+
         elif isinstance(stmt, PlayTone):
-            self._emit_play_tone(stmt)
+            freq = self._emit_expr(stmt.freq)
+            dur = self._emit_expr(stmt.duration)
+            self._lines.append(f"{pad}PlayTone({freq}, {dur});")
+
         elif isinstance(stmt, Display):
-            self._emit_display(stmt)
+            text = self._emit_expr(stmt.text)
+            line_expr = stmt.line
+            # If the line is a constant, use the LCD_LINE constant directly
+            if isinstance(line_expr, NumberLit) and line_expr.value in self.LCD_LINES:
+                lcd_line = self.LCD_LINES[line_expr.value]
+                self._lines.append(f"{pad}TextOut(0, {lcd_line}, {text});")
+            else:
+                # Compute Y from line number: (8 - line) * 8
+                line_val = self._emit_expr(line_expr)
+                self._lines.append(f"{pad}TextOut(0, (8 - {line_val}) * 8, {text});")
+
         elif isinstance(stmt, ClearScreen):
-            self._emit_clear_screen()
+            self._lines.append(f"{pad}ClearScreen();")
+
         elif isinstance(stmt, Wait):
-            self._emit_wait(stmt)
+            ms = self._emit_expr(stmt.milliseconds)
+            self._lines.append(f"{pad}Wait({ms});")
+
         elif isinstance(stmt, IfElse):
-            self._emit_if_else(stmt)
+            cond = self._emit_condition(stmt.condition)
+            self._lines.append(f"{pad}if ({cond}) {{")
+            for s in stmt.then_body:
+                self._emit_stmt(s, indent + 1)
+            if stmt.else_body:
+                self._lines.append(f"{pad}}} else {{")
+                for s in stmt.else_body:
+                    self._emit_stmt(s, indent + 1)
+            self._lines.append(f"{pad}}}")
+
         elif isinstance(stmt, Repeat):
-            self._emit_repeat(stmt)
+            count = self._emit_expr(stmt.count)
+            self._lines.append(f"{pad}repeat({count}) {{")
+            for s in stmt.body:
+                self._emit_stmt(s, indent + 1)
+            self._lines.append(f"{pad}}}")
+
         elif isinstance(stmt, Forever):
-            self._emit_forever(stmt)
+            self._lines.append(f"{pad}while(true) {{")
+            for s in stmt.body:
+                self._emit_stmt(s, indent + 1)
+            self._lines.append(f"{pad}}}")
+
         elif isinstance(stmt, FuncCallStmt):
-            self._emit_func_call(stmt)
+            args = ", ".join(self._emit_expr(a) for a in stmt.args)
+            self._lines.append(f"{pad}{stmt.name}({args});")
+
         else:
             raise ValueError(f"Unknown statement: {type(stmt).__name__}")
 
-    def _emit_assignment(self, stmt: Assignment):
-        expr_idx = self._emit_expr(stmt.expr)
-        var_idx = self._get_var(stmt.name)
-        self._emit(encode_instruction(OP_MOV, var_idx, expr_idx))
+    def _emit_condition(self, node) -> str:
+        """Emit a comparison expression as an NXC condition string."""
+        if isinstance(node, CompareExpr):
+            left = self._emit_expr(node.left)
+            right = self._emit_expr(node.right)
+            return f"{left} {node.op} {right}"
+        raise ValueError("Condition must be a CompareExpr")
 
-    # ── Motor control ───────────────────────────────────────────────────
+    # ── Function definition ──────────────────────────────────────────────
 
-    def _emit_motor_on(self, stmt: MotorOn):
-        """Emit OP_SETOUT to turn on a motor at a given power level."""
-        port_map = {"A": MOTOR_A, "B": MOTOR_B, "C": MOTOR_C}
-        port_val = port_map[stmt.port]
+    def _emit_func_def(self, fdef: FuncDef):
+        """Emit an NXC function (sub/void) definition."""
+        params = ", ".join(f"int {p}" for p in fdef.params)
+        self._lines.append(f"void {fdef.name}({params}) {{")
+        for stmt in fdef.body:
+            self._emit_stmt(stmt, indent=1)
+        self._lines.append("}")
 
-        port_idx = self._get_const_ubyte(port_val)
-        power_idx = self._emit_expr(stmt.power)
 
-        # We need DSTOC indices for the field IDs and values
-        flags_field = self._get_const_ubyte(OUT_FLAGS)
-        mode_field = self._get_const_ubyte(OUT_MODE)
-        speed_field = self._get_const_ubyte(OUT_SPEED)
-        runstate_field = self._get_const_ubyte(OUT_RUN_STATE)
-        regmode_field = self._get_const_ubyte(OUT_REG_MODE)
+# ─── nbc Integration ────────────────────────────────────────────────────────
 
-        update_val = self._get_const_ubyte(OUT_UPDATE_MODE | OUT_UPDATE_SPEED)
-        mode_val = self._get_const_ubyte(OUT_MODE_MOTORON | OUT_MODE_BRAKE | OUT_MODE_REGULATED)
-        runstate_val = self._get_const_ubyte(OUT_RUNSTATE_RUNNING)
-        regmode_val = self._get_const_ubyte(OUT_REGMODE_SPEED)
+class CompileError(Exception):
+    """Raised when the nbc compiler fails or is not found."""
+    pass
 
-        # OP_SETOUT: variable-length
-        # Format: instr_word | operand_count | port | field1 | val1 | field2 | val2 | ...
-        operands = [
-            port_idx,
-            flags_field, update_val,
-            mode_field, mode_val,
-            speed_field, power_idx,
-            runstate_field, runstate_val,
-            regmode_field, regmode_val,
-        ]
-        operand_count = len(operands)
-        instr_word = _to_i16((SIZE_VAR << 12) | (OP_SETOUT & 0xFF))
-        self._emit([instr_word, _to_i16(operand_count)] + [_to_i16(o) for o in operands])
 
-    def _emit_motor_off(self, stmt: MotorOff):
-        """Emit OP_SETOUT to stop a motor with brake."""
-        port_map = {"A": MOTOR_A, "B": MOTOR_B, "C": MOTOR_C}
-        port_val = port_map[stmt.port]
+def _find_nbc() -> str:
+    """Locate the nbc compiler binary.
 
-        port_idx = self._get_const_ubyte(port_val)
-        flags_field = self._get_const_ubyte(OUT_FLAGS)
-        mode_field = self._get_const_ubyte(OUT_MODE)
-        speed_field = self._get_const_ubyte(OUT_SPEED)
-        runstate_field = self._get_const_ubyte(OUT_RUN_STATE)
+    Search order:
+    1. NBC_PATH environment variable
+    2. Bundled with the app (PyInstaller or next to compiler.py)
+    3. System PATH
+    """
+    # 1. Environment variable
+    env_path = os.environ.get("NBC_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
 
-        update_val = self._get_const_ubyte(OUT_UPDATE_MODE | OUT_UPDATE_SPEED)
-        mode_val = self._get_const_ubyte(OUT_MODE_MOTORON | OUT_MODE_BRAKE)
-        speed_val = self._get_const_ubyte(0)
-        runstate_val = self._get_const_ubyte(OUT_RUNSTATE_RUNNING)
+    # 2. Bundled with app — check PyInstaller _MEIPASS and project-relative paths
+    search_dirs = []
 
-        operands = [
-            port_idx,
-            flags_field, update_val,
-            mode_field, mode_val,
-            speed_field, speed_val,
-            runstate_field, runstate_val,
-        ]
-        operand_count = len(operands)
-        instr_word = _to_i16((SIZE_VAR << 12) | (OP_SETOUT & 0xFF))
-        self._emit([instr_word, _to_i16(operand_count)] + [_to_i16(o) for o in operands])
+    # PyInstaller bundle
+    meipass = getattr(__import__("sys"), "_MEIPASS", None)
+    if meipass:
+        search_dirs.append(meipass)
 
-    def _emit_motor_coast(self, stmt: MotorCoast):
-        """Emit OP_SETOUT to coast a motor (no power, no brake)."""
-        port_map = {"A": MOTOR_A, "B": MOTOR_B, "C": MOTOR_C}
-        port_val = port_map[stmt.port]
+    # Next to this file (development mode)
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs.append(os.path.join(this_dir, os.pardir))  # project root
+    search_dirs.append(this_dir)
 
-        port_idx = self._get_const_ubyte(port_val)
-        flags_field = self._get_const_ubyte(OUT_FLAGS)
-        mode_field = self._get_const_ubyte(OUT_MODE)
-        speed_field = self._get_const_ubyte(OUT_SPEED)
-        runstate_field = self._get_const_ubyte(OUT_RUN_STATE)
+    for d in search_dirs:
+        candidate = os.path.join(d, "nbc")
+        if os.path.isfile(candidate):
+            return candidate
 
-        update_val = self._get_const_ubyte(OUT_UPDATE_MODE | OUT_UPDATE_SPEED)
-        mode_val = self._get_const_ubyte(OUT_MODE_COAST)
-        speed_val = self._get_const_ubyte(0)
-        runstate_val = self._get_const_ubyte(OUT_RUNSTATE_IDLE)
+    # 3. System PATH
+    system_nbc = shutil.which("nbc")
+    if system_nbc:
+        return system_nbc
 
-        operands = [
-            port_idx,
-            flags_field, update_val,
-            mode_field, mode_val,
-            speed_field, speed_val,
-            runstate_field, runstate_val,
-        ]
-        operand_count = len(operands)
-        instr_word = _to_i16((SIZE_VAR << 12) | (OP_SETOUT & 0xFF))
-        self._emit([instr_word, _to_i16(operand_count)] + [_to_i16(o) for o in operands])
+    raise CompileError(
+        "nbc compiler not found. Install it or set NBC_PATH environment variable."
+    )
 
-    # ── Sensors ─────────────────────────────────────────────────────────
 
-    def _emit_sensor_read(self, node: SensorCall) -> int:
-        """Configure sensor and read its scaled value. Returns DSTOC index of result."""
-        port = node.port - 1  # Convert 1-based to 0-based
+def _find_nbc_include() -> str:
+    """Locate the nbc include directory (containing NXCDefs.h)."""
+    # Check next to the nbc binary first
+    try:
+        nbc_path = _find_nbc()
+    except CompileError:
+        nbc_path = None
 
-        sensor_info = {
-            "touch":      (SENSOR_TYPE_TOUCH, SENSOR_MODE_BOOLEAN),
-            "light":      (SENSOR_TYPE_LIGHT_ACTIVE, SENSOR_MODE_PCTFULLSCALE),
-            "sound":      (SENSOR_TYPE_SOUND_DB, SENSOR_MODE_PCTFULLSCALE),
-            "ultrasonic": (SENSOR_TYPE_LOWSPEED_9V, SENSOR_MODE_RAW),
-        }
-        sensor_type, sensor_mode = sensor_info[node.sensor_type]
+    search_dirs = []
 
-        port_idx = self._get_const_ubyte(port)
-        result = self._alloc_temp(TC_SLONG)
+    if nbc_path:
+        search_dirs.append(os.path.dirname(nbc_path))
 
-        if node.sensor_type == "ultrasonic":
-            # Ultrasonic uses I2C (lowspeed) — needs special handling
-            self._emit_ultrasonic_read(port, port_idx, result)
-        else:
-            # Standard analog sensor
-            self._emit_analog_sensor_read(port, port_idx, sensor_type, sensor_mode, result)
+    # PyInstaller bundle
+    meipass = getattr(__import__("sys"), "_MEIPASS", None)
+    if meipass:
+        search_dirs.append(os.path.join(meipass, "nbc_include"))
+        search_dirs.append(meipass)
 
-        return result
+    # Next to this file (development mode)
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs.append(os.path.join(this_dir, os.pardir, "nbc_include"))
+    search_dirs.append(os.path.join(this_dir, "nbc_include"))
 
-    def _emit_analog_sensor_read(self, port, port_idx, sensor_type, sensor_mode, result_idx):
-        """Configure and read an analog sensor (touch, light, sound)."""
-        type_field = self._get_const_ubyte(IN_TYPE)
-        mode_field = self._get_const_ubyte(IN_MODE)
-        scaled_field = self._get_const_ubyte(IN_SCALED)
-        invalid_field = self._get_const_ubyte(IN_INVALID)
+    # System-wide
+    search_dirs.append("/usr/local/include/nbc")
 
-        type_val = self._get_const_ubyte(sensor_type)
-        mode_val = self._get_const_ubyte(sensor_mode)
+    for d in search_dirs:
+        candidate = os.path.join(d, "NXCDefs.h")
+        if os.path.isfile(candidate):
+            return d
 
-        # Configure sensor type and mode if not already done
-        if port not in self._sensor_configured:
-            # OP_SETIN port, type_field, type_val
-            self._emit(encode_instruction(OP_SETIN, port_idx, type_field, type_val))
-            # OP_SETIN port, mode_field, mode_val
-            self._emit(encode_instruction(OP_SETIN, port_idx, mode_field, mode_val))
-            # Clear invalid data flag
-            self._emit(encode_instruction(OP_SETIN, port_idx, invalid_field, self._get_const_ubyte(0)))
-            self._sensor_configured.add(port)
+    raise CompileError(
+        "NXC include files (NXCDefs.h) not found. "
+        "Ensure nbc_include/ is present next to the nbc binary."
+    )
 
-        # OP_GETIN result, port, scaled_field
-        self._emit(encode_instruction(OP_GETIN, result_idx, port_idx, scaled_field))
 
-    def _emit_ultrasonic_read(self, port, port_idx, result_idx):
-        """Read ultrasonic sensor via I2C (lowspeed) protocol.
+def _run_nbc(nxc_source: str, output_path: str):
+    """Write NXC source to a temp file and compile it with nbc.
 
-        The ultrasonic sensor is an I2C device. Reading it requires:
-        1. Configure port as LOWSPEED_9V
-        2. COMM_LS_WRITE to send I2C read request
-        3. COMM_LS_CHECKSTATUS to wait for data
-        4. COMM_LS_READ to get the result
-        """
-        type_field = self._get_const_ubyte(IN_TYPE)
-        mode_field = self._get_const_ubyte(IN_MODE)
-        type_val = self._get_const_ubyte(SENSOR_TYPE_LOWSPEED_9V)
-        mode_val = self._get_const_ubyte(SENSOR_MODE_RAW)
+    Raises:
+        CompileError: If nbc fails or is not found.
+    """
+    nbc_path = _find_nbc()
+    include_dir = _find_nbc_include()
 
-        if port not in self._sensor_configured:
-            self._emit(encode_instruction(OP_SETIN, port_idx, type_field, type_val))
-            self._emit(encode_instruction(OP_SETIN, port_idx, mode_field, mode_val))
-            self._sensor_configured.add(port)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".nxc", delete=False
+    ) as f:
+        f.write(nxc_source)
+        nxc_path = f.name
 
-        # For ultrasonic, we use syscalls:
-        # 1. COMM_LS_WRITE: write I2C command to request distance reading
-        # 2. COMM_LS_CHECKSTATUS: check if data is ready
-        # 3. COMM_LS_READ: read the result
-
-        # LS_WRITE cluster: {Status(UBYTE), Port(UBYTE), Buffer(ARRAY of UBYTE), ReturnLen(UBYTE)}
-        ls_write_cluster, ls_write_members = self.ds.add_cluster(
-            [TC_UBYTE, TC_UBYTE, TC_UBYTE, TC_UBYTE],
-            name="lsw",
-            defaults=[0, port, 0, 1]  # status=0, port, buffer_placeholder=0, return_len=1
+    try:
+        result = subprocess.run(
+            [nbc_path, nxc_path, f"-O={output_path}", f"-I={include_dir}",
+             "-v=105"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
 
-        # We need to build the I2C command buffer: [0x02, 0x42] (address, register)
-        i2c_buf = self.ds.add_string("\x02\x42", name="i2c_cmd")
-
-        # Actually, the LS_WRITE syscall cluster format is different in the NXT firmware.
-        # Let's use a simpler approach: read the scaled value directly since the NXT
-        # firmware can handle ultrasonic via GETIN on newer firmware versions.
-        # For maximum compatibility, we'll use GETIN with IN_SCALED which works
-        # when the sensor has been configured as LOWSPEED_9V.
-        scaled_field = self._get_const_ubyte(IN_SCALED)
-        self._emit(encode_instruction(OP_GETIN, result_idx, port_idx, scaled_field))
-
-    # ── Sound ───────────────────────────────────────────────────────────
-
-    def _emit_play_tone(self, stmt: PlayTone):
-        """Emit OP_SYSCALL for SoundPlayTone.
-
-        SoundPlayTone cluster: {Status(UBYTE), Frequency(UWORD), Duration(UWORD), Loop(UBYTE), Volume(UBYTE)}
-        """
-        freq_val = self._emit_expr(stmt.freq)
-        dur_val = self._emit_expr(stmt.duration)
-
-        # Create the syscall parameter cluster
-        cluster_idx, members = self.ds.add_cluster(
-            [TC_UBYTE, TC_UWORD, TC_UWORD, TC_UBYTE, TC_UBYTE],
-            name="tone",
-            defaults=[0, 0, 0, 0, 3]  # status=0, freq=0, dur=0, loop=0, volume=3
-        )
-        status_idx, freq_idx, dur_idx, loop_idx, vol_idx = members
-
-        # Set frequency and duration from expressions
-        self._emit(encode_instruction(OP_MOV, freq_idx, freq_val))
-        self._emit(encode_instruction(OP_MOV, dur_idx, dur_val))
-
-        # Syscall
-        syscall_id = self._get_const_ubyte(SYSCALL_SOUND_PLAY_TONE)
-        self._emit(encode_instruction(OP_SYSCALL, syscall_id, cluster_idx))
-
-    # ── Display ─────────────────────────────────────────────────────────
-
-    def _emit_display(self, stmt: Display):
-        """Emit OP_SYSCALL for DrawText.
-
-        DrawText cluster: {Result(SBYTE), Location(Point cluster), Text(string)}
-        Point cluster: {X(SWORD), Y(SWORD)}
-
-        Actually the NXT DrawText syscall takes:
-        {Result(SWORD), Location.X(UWORD), Location.Y(UWORD), Filename(array/string)}
-
-        Let me use simplified flat cluster approach since we don't nest clusters.
-        The actual firmware expects: Status(SWORD), Location{X(SWORD),Y(SWORD)}, Text(string)
-        But since we can't easily nest clusters, we'll flatten it.
-        """
-        text_idx = self._emit_expr(stmt.text)
-        line_idx = self._emit_expr(stmt.line)
-
-        # Compute Y position: NXT display is 64 pixels tall, 8 lines of 8 pixels
-        # Line 1 = Y 56, Line 2 = Y 48, etc. (Y increases downward, text drawn from top-left)
-        y_tmp = self._alloc_temp(TC_SLONG)
-        eight = self._get_const(8)
-        sixty_four = self._get_const(56)
-        self._emit(encode_instruction(OP_MUL, y_tmp, line_idx, eight))
-        y_pos = self._alloc_temp(TC_SLONG)
-        self._emit(encode_instruction(OP_SUB, y_pos, sixty_four, y_tmp))
-
-        # DrawText cluster: {Status(SWORD), Location(cluster{X,Y}), Text(array)}
-        # We'll build this as a flat cluster since the NXT expects specific layout
-        cluster_idx, members = self.ds.add_cluster_with_string(
-            [TC_SWORD, TC_SWORD, TC_SWORD, TC_ARRAY],
-            string_defaults={3: ""},
-            name="drawtext"
-        )
-        status_m, x_m, y_m, text_m = members
-
-        # Set X to 0, Y to computed position
-        self._emit(encode_instruction(OP_MOV, x_m, self._get_const(0)))
-        self._emit(encode_instruction(OP_MOV, y_m, y_pos))
-        self._emit(encode_instruction(OP_MOV, text_m, text_idx))
-
-        syscall_id = self._get_const_ubyte(SYSCALL_DRAW_TEXT)
-        self._emit(encode_instruction(OP_SYSCALL, syscall_id, cluster_idx))
-
-    def _emit_clear_screen(self):
-        """Emit a screen clear. Uses DrawText syscall trick or dedicated syscall."""
-        # NXT firmware 1.28+ has a SetScreenMode syscall (38) that can clear
-        # We'll use it with a simple cluster: {Status(SWORD), ScreenMode(UWORD)}
-        # ScreenMode = 0x00FF clears the screen
-        # Actually let's just use the standard approach — fill with spaces or use
-        # the CLEAR_SCREEN syscall (id 38 on fw 1.28+)
-        cluster_idx, members = self.ds.add_cluster(
-            [TC_SWORD, TC_UWORD],
-            name="clrscr",
-            defaults=[0, 0x00]
-        )
-
-        syscall_id = self._get_const_ubyte(SYSCALL_CLEAR_SCREEN)
-        self._emit(encode_instruction(OP_SYSCALL, syscall_id, cluster_idx))
-
-    # ── Timing ──────────────────────────────────────────────────────────
-
-    def _emit_wait(self, stmt: Wait):
-        """Emit OP_WAIT."""
-        ms_idx = self._emit_expr(stmt.milliseconds)
-        self._emit(encode_instruction(OP_WAIT, ms_idx))
-
-    # ── Function calls ─────────────────────────────────────────────────
-
-    def _emit_func_call(self, stmt: FuncCallStmt):
-        """Emit a user function call: copy args to params, then OP_SUBCALL."""
-        if stmt.name not in self._funcs:
-            raise ValueError(f"Unknown function: '{stmt.name}'")
-        finfo = self._funcs[stmt.name]
-
-        if len(stmt.args) != len(finfo["params"]):
-            raise ValueError(
-                f"Function '{stmt.name}' expects {len(finfo['params'])} "
-                f"argument(s), got {len(stmt.args)}")
-
-        # Copy argument values into parameter slots
-        for arg_expr, param_idx in zip(stmt.args, finfo["param_indices"]):
-            arg_val = self._emit_expr(arg_expr)
-            self._emit(encode_instruction(OP_MOV, param_idx, arg_val))
-
-        # Call the subroutine clump
-        self._emit(encode_instruction(
-            OP_SUBCALL, finfo["clump_id"], finfo["caller_ret"]))
-
-    # ── Control flow ────────────────────────────────────────────────────
-
-    def _emit_if_else(self, stmt: IfElse):
-        """Emit if/else with branch instructions.
-
-        Pattern:
-            BRCMP <cc> else_label, left, right   # branch to else if condition FALSE
-            ... then body ...
-            JMP end_label
-          else_label:
-            ... else body ...
-          end_label:
-        """
-        cond = stmt.condition
-        if not isinstance(cond, CompareExpr):
-            raise ValueError("If condition must be a comparison")
-
-        left_idx = self._emit_expr(cond.left)
-        right_idx = self._emit_expr(cond.right)
-
-        # Invert the comparison for branching (branch when condition is FALSE)
-        invert_cc = {
-            "<": CC_GTEQ,   # branch if >=
-            ">": CC_LTEQ,   # branch if <=
-            "==": CC_NEQ,   # branch if !=
-            "!=": CC_EQ,    # branch if ==
-            "<=": CC_GT,    # branch if >
-            ">=": CC_LT,    # branch if <
-        }
-        cc = invert_cc[cond.op]
-
-        # Emit BRCMP with placeholder offset
-        brcmp_pos = self._current_offset()
-        # BRCMP: instr_word(with cc), offset, left, right — 8 bytes = 4 words
-        self._emit(encode_instruction(OP_BRCMP, 0, left_idx, right_idx, cc=cc))
-
-        # Emit then body
-        for s in stmt.then_body:
-            self._emit_stmt(s)
-
-        if stmt.else_body:
-            # Emit JMP over else body (placeholder)
-            jmp_pos = self._current_offset()
-            self._emit(encode_instruction(OP_JMP, 0))
-
-            # Patch BRCMP to jump here (else label)
-            else_offset = self._current_offset()
-            # BRCMP offset is relative, in bytes, from the instruction after BRCMP
-            # The offset field is at brcmp_pos + 1 (second word)
-            self.code[brcmp_pos + 1] = _to_i16((else_offset - brcmp_pos) * 2)
-
-            # Emit else body
-            for s in stmt.else_body:
-                self._emit_stmt(s)
-
-            # Patch JMP to jump here (end label)
-            end_offset = self._current_offset()
-            self.code[jmp_pos + 1] = _to_i16((end_offset - jmp_pos) * 2)
-        else:
-            # No else: patch BRCMP to jump here
-            end_offset = self._current_offset()
-            self.code[brcmp_pos + 1] = _to_i16((end_offset - brcmp_pos) * 2)
-
-    def _emit_repeat(self, stmt: Repeat):
-        """Emit a counted loop.
-
-        Pattern:
-            counter = count_expr
-          loop_top:
-            BRCMP CC_LTEQ end_label, counter, 0   # exit when counter <= 0
-            ... body ...
-            SUB counter, counter, 1
-            JMP loop_top
-          end_label:
-        """
-        count_idx = self._emit_expr(stmt.count)
-        counter = self._alloc_temp()
-        self._emit(encode_instruction(OP_MOV, counter, count_idx))
-
-        loop_top = self._current_offset()
-
-        # Branch to end if counter <= 0
-        brcmp_pos = self._current_offset()
-        self._emit(encode_instruction(OP_BRCMP, 0, counter, self._const_zero, cc=CC_LTEQ))
-
-        # Body
-        for s in stmt.body:
-            self._emit_stmt(s)
-
-        # Decrement counter
-        self._emit(encode_instruction(OP_SUB, counter, counter, self._const_one))
-
-        # Jump back to top
-        jmp_pos = self._current_offset()
-        self._emit(encode_instruction(OP_JMP, 0))
-        # Patch JMP offset (relative, in bytes)
-        self.code[jmp_pos + 1] = _to_i16((loop_top - jmp_pos) * 2)
-
-        # Patch BRCMP to end
-        end_offset = self._current_offset()
-        self.code[brcmp_pos + 1] = _to_i16((end_offset - brcmp_pos) * 2)
-
-    def _emit_forever(self, stmt: Forever):
-        """Emit an infinite loop.
-
-        Pattern:
-          loop_top:
-            ... body ...
-            JMP loop_top
-        """
-        loop_top = self._current_offset()
-
-        for s in stmt.body:
-            self._emit_stmt(s)
-
-        jmp_pos = self._current_offset()
-        self._emit(encode_instruction(OP_JMP, 0))
-        self.code[jmp_pos + 1] = _to_i16((loop_top - jmp_pos) * 2)
+        if result.returncode != 0:
+            # Extract error lines from stderr/stdout (nbc writes to stdout)
+            error_output = result.stderr or result.stdout or "Unknown error"
+            # Filter out status lines to show only errors
+            error_lines = [
+                line for line in error_output.splitlines()
+                if not line.startswith("# Status:")
+            ]
+            error_msg = "\n".join(error_lines).strip()
+            if not error_msg:
+                error_msg = error_output.strip()
+            raise CompileError(f"nbc compilation failed:\n{error_msg}")
+    except FileNotFoundError:
+        raise CompileError(f"nbc compiler not found at: {nbc_path}")
+    except subprocess.TimeoutExpired:
+        raise CompileError("nbc compilation timed out (30s)")
+    finally:
+        os.unlink(nxc_path)
 
 
 # ─── Public API ─────────────────────────────────────────────────────────────
 
 def compile_source(source: str, output_path: str) -> str:
     """Compile NXT DSL source code to an .rxe file.
+
+    Pipeline: DSL → Lexer → Parser → AST → NXCEmitter → .nxc → nbc → .rxe
 
     Args:
         source: The DSL source code string.
@@ -1231,17 +978,15 @@ def compile_source(source: str, output_path: str) -> str:
         The output path.
 
     Raises:
-        SyntaxError: If the source has syntax errors.
-        ValueError: If code generation fails.
+        SyntaxError: If the DSL source has syntax errors.
+        CompileError: If NXC compilation (nbc) fails.
     """
-    from .rxe_writer import write_rxe
-
     tokens = lex(source)
     parser = Parser(tokens)
     func_defs, main_stmts = parser.parse()
-    gen = CodeGenerator()
-    (dstoc_bytes, static_defaults, dynamic_defaults,
-     ds_static_size, code_words, clump_records) = gen.compile(func_defs, main_stmts)
-    write_rxe(dstoc_bytes, static_defaults, dynamic_defaults,
-              ds_static_size, code_words, output_path, clump_records)
+
+    emitter = NXCEmitter()
+    nxc_source = emitter.emit(func_defs, main_stmts)
+    _run_nbc(nxc_source, output_path)
+
     return output_path

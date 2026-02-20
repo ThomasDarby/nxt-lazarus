@@ -11,9 +11,9 @@ import tempfile
 import traceback
 
 try:
-    from .compiler import compile_source
+    from .compiler import compile_source, CompileError
 except ImportError:
-    from nxt_toolkit.compiler import compile_source
+    from nxt_toolkit.compiler import compile_source, CompileError
 
 # Default file extension
 FILE_EXT = ".nxt"
@@ -495,11 +495,23 @@ class NXTToolkitApp:
             self._log(f"Syntax error: {e}", "error")
             self._set_status("Compile failed")
             return None
-        except Exception as e:
+        except CompileError as e:
             self._log(f"Compile error: {e}", "error")
+            self._set_status("Compile failed")
+            return None
+        except Exception as e:
+            self._log(f"Unexpected error: {e}", "error")
             self._log(traceback.format_exc(), "error")
             self._set_status("Compile failed")
             return None
+
+    def _new_connection(self):
+        """Create a fresh NXT USB connection."""
+        try:
+            from .usb import NXTConnection
+        except ImportError:
+            from nxt_toolkit.usb import NXTConnection
+        return NXTConnection.find()
 
     def _upload(self):
         """Compile and upload to NXT."""
@@ -511,50 +523,72 @@ class NXTToolkitApp:
         self._set_status("Connecting to NXT...")
         self._log("Connecting to NXT...", "info")
 
+        conn = None
         try:
-            try:
-                from .usb import NXTConnection
-            except ImportError:
-                from nxt_toolkit.usb import NXTConnection
-            conn = NXTConnection.find()
+            conn = self._new_connection()
 
             def progress(sent, total):
                 pct = int(sent / total * 100)
                 self._set_status(f"Uploading... {pct}%")
 
+            def upload_log(msg):
+                self._log(f"  {msg}", "info")
+
             self._log(f"Uploading {nxt_filename}...", "info")
-            conn.upload_file(rxe_path, nxt_filename, progress_callback=progress)
+            conn.upload_file(rxe_path, nxt_filename, progress_callback=progress,
+                             log=upload_log)
             self._log(f"Upload complete: {nxt_filename}", "success")
             self._set_status("Upload complete")
-            conn.close()
             return nxt_filename
         except Exception as e:
             self._log(f"Upload error: {e}", "error")
             self._set_status("Upload failed")
             return None
+        finally:
+            if conn:
+                conn.close()
 
     def _run(self):
         """Compile, upload, and start the program."""
-        nxt_filename = self._upload()
-        if not nxt_filename:
+        rxe_path = self._compile()
+        if not rxe_path:
             return
 
-        self._set_status("Starting program...")
-        self._log("Starting program on NXT...", "info")
+        nxt_filename = self._get_nxt_filename()
+        self._set_status("Connecting to NXT...")
+        self._log("Connecting to NXT...", "info")
 
+        conn = None
         try:
-            try:
-                from .usb import NXTConnection
-            except ImportError:
-                from nxt_toolkit.usb import NXTConnection
-            conn = NXTConnection.find()
+            conn = self._new_connection()
+
+            def progress(sent, total):
+                pct = int(sent / total * 100)
+                self._set_status(f"Uploading... {pct}%")
+
+            def upload_log(msg):
+                self._log(f"  {msg}", "info")
+
+            self._log(f"Uploading {nxt_filename}...", "info")
+            conn.upload_file(rxe_path, nxt_filename, progress_callback=progress,
+                             log=upload_log)
+            self._log(f"Upload complete: {nxt_filename}", "success")
+
+            # Brief pause to let the NXT finalize the flash write
+            import time
+            time.sleep(0.5)
+
+            self._set_status("Starting program...")
+            self._log("Starting program on NXT...", "info")
             conn.start_program(nxt_filename)
             self._log("Program started!", "success")
             self._set_status("Running on NXT")
-            conn.close()
         except Exception as e:
-            self._log(f"Start error: {e}", "error")
-            self._set_status("Start failed")
+            self._log(f"Run error: {e}", "error")
+            self._set_status("Run failed")
+        finally:
+            if conn:
+                conn.close()
 
     def _test_connection(self):
         """Test NXT USB connection."""
@@ -562,24 +596,25 @@ class NXTToolkitApp:
         self._set_status("Searching for NXT...")
         self._log("Searching for NXT brick...", "info")
 
+        conn = None
         try:
-            try:
-                from .usb import NXTConnection
-            except ImportError:
-                from nxt_toolkit.usb import NXTConnection
-            conn = NXTConnection.find()
+            conn = self._new_connection()
             info = conn.get_device_info()
+            fw = conn.get_firmware_version()
             self._log(f"Connected to: {info['name']}", "success")
+            self._log(f"Firmware: {fw['firmware_version']} (protocol {fw['protocol_version']})", "info")
             self._log(f"Bluetooth: {info['bt_address']}", "info")
             self._log(f"Free flash: {info['free_flash']:,} bytes", "info")
 
             # Play a tone to confirm
             conn.play_tone(523, 200)
             self._set_status(f"Connected: {info['name']}")
-            conn.close()
         except Exception as e:
             self._log(f"Connection failed: {e}", "error")
             self._set_status("Not connected")
+        finally:
+            if conn:
+                conn.close()
 
     # ── Help ────────────────────────────────────────────────────────────
 
