@@ -1,16 +1,16 @@
 #!/bin/bash
-# Build NXT Toolkit as a standalone macOS .app
+# Build NXT Lazarus as a standalone macOS .app
 #
 # Prerequisites:
 #   pip install pyinstaller pyusb
 #   brew install libusb
 #
-# Output: dist/NXT Toolkit.app
+# Output: dist/NXT Lazarus.app
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="NXT Toolkit"
+APP_NAME="NXT Lazarus"
 
 # Find libusb dylib
 LIBUSB=""
@@ -44,6 +44,7 @@ pyinstaller \
     --hidden-import nxt_toolkit.dataspace \
     --hidden-import nxt_toolkit.rxe_writer \
     --hidden-import nxt_toolkit.usb \
+    --icon icon.icns \
     --osx-bundle-identifier com.nxttoolkit.app \
     nxt_toolkit/app.py
 

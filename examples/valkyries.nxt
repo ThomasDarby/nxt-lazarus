@@ -1,0 +1,66 @@
+# Ride of the Valkyries - Wagner
+# The iconic horn call from Act III of Die Walkure
+# Notes transcribed from MIDI (Brass track, concert pitch)
+
+clear_screen()
+display("Ride of the", 1)
+display("Valkyries!", 3)
+
+# -- Group 1: B minor ascent (B -> D) --
+# Grace notes: B3, F#3, B3
+play_tone(247, 80)
+wait(90)
+play_tone(185, 80)
+wait(90)
+play_tone(247, 80)
+wait(90)
+# Held: D4
+play_tone(294, 220)
+wait(250)
+# Held: B3
+play_tone(247, 220)
+wait(250)
+
+# -- Group 2: (D -> F#) --
+# Grace notes: D4, B3, D4
+play_tone(294, 80)
+wait(90)
+play_tone(247, 80)
+wait(90)
+play_tone(294, 80)
+wait(90)
+# Held: F#4
+play_tone(370, 220)
+wait(250)
+# Held: D4
+play_tone(294, 220)
+wait(250)
+
+# -- Group 3: (F# -> A) --
+# Grace notes: F#4, D4, F#4
+play_tone(370, 80)
+wait(90)
+play_tone(294, 80)
+wait(90)
+play_tone(370, 80)
+wait(90)
+# Held: A4
+play_tone(440, 220)
+wait(250)
+# Held: A3
+play_tone(220, 220)
+wait(250)
+
+# -- Group 4: Resolution --
+# Grace notes: D4, A3, D4
+play_tone(294, 80)
+wait(90)
+play_tone(220, 80)
+wait(90)
+play_tone(294, 80)
+wait(90)
+# Final: F#4 (long held) -> B3 (tonic resolution)
+play_tone(370, 600)
+wait(650)
+play_tone(247, 400)
+wait(1500)

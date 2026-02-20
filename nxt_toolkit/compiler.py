@@ -1,4 +1,4 @@
-"""Compiler for the NXT Toolkit DSL.
+"""Compiler for the NXT Lazarus DSL.
 
 Pipeline: Source → Lexer → Parser → AST → NXCEmitter → .nxc text → nbc → .rxe
 
