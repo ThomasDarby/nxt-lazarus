@@ -769,14 +769,14 @@ class NXCEmitter:
         elif isinstance(stmt, Display):
             text = self._emit_expr(stmt.text)
             line_expr = stmt.line
-            # If the line is a constant, use the LCD_LINE constant directly
+            # Use TextOut for strings, NumOut for numbers/variables
+            out_func = "TextOut" if isinstance(stmt.text, StringLit) else "NumOut"
             if isinstance(line_expr, NumberLit) and line_expr.value in self.LCD_LINES:
                 lcd_line = self.LCD_LINES[line_expr.value]
-                self._lines.append(f"{pad}TextOut(0, {lcd_line}, {text});")
+                self._lines.append(f"{pad}{out_func}(0, {lcd_line}, {text});")
             else:
-                # Compute Y from line number: (8 - line) * 8
                 line_val = self._emit_expr(line_expr)
-                self._lines.append(f"{pad}TextOut(0, (8 - {line_val}) * 8, {text});")
+                self._lines.append(f"{pad}{out_func}(0, (8 - {line_val}) * 8, {text});")
 
         elif isinstance(stmt, ClearScreen):
             self._lines.append(f"{pad}ClearScreen();")
