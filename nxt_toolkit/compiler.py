@@ -629,6 +629,12 @@ class NXCEmitter:
             self._prescan_stmts(fdef.body, exclude_vars=set(fdef.params))
         self._prescan_stmts(main_stmts)
 
+        # Global variable declarations (visible to all functions and main)
+        for var in sorted(self._variables):
+            self._lines.append(f"int {var};")
+        if self._variables:
+            self._lines.append("")
+
         # Emit function definitions
         for fdef in func_defs:
             self._emit_func_def(fdef)
@@ -649,11 +655,7 @@ class NXCEmitter:
             elif sensor_type == "ultrasonic":
                 self._lines.append(f"  SetSensorLowspeed({nxc_port});")
 
-        # Variable declarations at top of main
-        for var in sorted(self._variables):
-            self._lines.append(f"  int {var};")
-
-        if self._sensors or self._variables:
+        if self._sensors:
             self._lines.append("")
 
         # Main body statements
