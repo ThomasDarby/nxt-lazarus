@@ -35,7 +35,9 @@ pyinstaller \
     --onedir \
     --noconfirm \
     --add-binary "$LIBUSB:." \
+    --add-binary "nbc:." \
     --add-data "examples:examples" \
+    --add-data "nbc_include:nbc_include" \
     --hidden-import usb.backend.libusb1 \
     --hidden-import usb.backend.libusb0 \
     --hidden-import usb.backend.openusb \
