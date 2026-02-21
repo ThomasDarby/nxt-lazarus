@@ -46,6 +46,17 @@ jobs:
             --osx-bundle-identifier com.nxttoolkit.app \
             nxt_toolkit/app.py
 
+      - name: Lower deployment target to macOS 12.0
+        run: |
+          find "dist/NXT Lazarus.app" -type f \( -perm +111 -o -name '*.dylib' -o -name '*.so' \) | while read -r binary; do
+            file "$binary" 2>/dev/null | grep -q "Mach-O" || continue
+            minos=$(vtool -show-build "$binary" 2>/dev/null | grep "minos" | head -1 | awk '{print $2}')
+            major=${minos%%.*}
+            [ -n "$major" ] && [ "$major" -gt 12 ] 2>/dev/null || continue
+            vtool -set-build-version macos 12.0 15.5 -replace -output "$binary.tmp" "$binary" && mv "$binary.tmp" "$binary" && chmod +x "$binary"
+          done
+          codesign -fs - --deep "dist/NXT Lazarus.app"
+
       - name: Create DMG
         run: |
           hdiutil create \
